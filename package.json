@@ -1,0 +1,21 @@
+{
+  "name": "@jive-sh/skill-sync-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "The service behind @jive-sh/skill-sync: file index in D1, contents in R2, passkey login.",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250204.0",
+    "@jive-sh/skill-sync": "file:../skill-sync/dist/base",
+    "@simplewebauthn/server": "^14.0.3",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.0.0"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "schema": "wrangler d1 execute jive-skill-sync-db --remote --file src/schema.sql",
+    "dev": "wrangler dev --port 8799 --local",
+    "audit": "tsc --noEmit -p tsconfig.json"
+  }
+}

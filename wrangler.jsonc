@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "jive-skill-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+  // Served only at skill-sync.jive.sh. The passkey's relying party is jive.sh, so sign-in could never
+  // work on a workers.dev address anyway, and a second public URL is one more thing to secure.
+  "workers_dev": false,
+  // The deployed version's id, so an open dashboard can tell it is out of date and reload itself.
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "jive-skill-sync-db", "database_id": "dfdfeddf-7624-4bb9-84f5-4044c2518736" }
+  ],
+  // The hub every daemon and dashboard connects to. SQLite-backed because that is the only kind the Workers
+  // free plan offers; the hub keeps nothing in it, but the class must be declared one way or the other.
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Hub"] }
+  ],
+  "r2_buckets": [
+    { "binding": "CONTENT", "bucket_name": "jive-skill-sync-content" }
+  ],
+  "routes": [
+    { "pattern": "skill-sync.jive.sh", "custom_domain": true }
+  ]
+}

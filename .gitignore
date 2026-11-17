@@ -1,0 +1,8 @@
+node_modules
+dist
+.wrangler
+.e2e
+.test-home
+.dev.vars*
+.env*
+.DS_Store
