@@ -32,9 +32,9 @@ const CODEC = `
 const b64urlToBytes = (s) => Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")), c => c.charCodeAt(0));
 const bytesToB64url = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");
 const say = (m) => { document.getElementById("status").textContent = m; };
-/** One passkey ceremony. With a machine, the answer carries that machine's token; either way the
- *  response sets this browser's dashboard session. */
-const signIn = async (machine) => {
+/** One passkey ceremony. With a sign-in request, it approves that machine; either way the response sets this
+ *  browser's dashboard session. */
+const signIn = async (request) => {
   say("Requesting options…");
   const options = await (await fetch("/login/options", { method: "POST" })).json();
   if (options.error) throw new Error(options.error);
@@ -57,7 +57,7 @@ const signIn = async (machine) => {
   };
   const result = await (await fetch("/login/verify", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ response: payload, challenge, ...(machine === undefined ? {} : { machine }) }),
+    body: JSON.stringify({ response: payload, challenge, ...(request === undefined ? {} : { request }) }),
   })).json();
   if (result.error) throw new Error(result.error);
   return result;
@@ -107,25 +107,30 @@ document.getElementById("go").onclick = async () => {
 };`,
 );
 
-export const loginPage = (port: number, machine: string): Response => shell(
-  "Sign in",
-  `<h1>Sign in to skill sync</h1>
-   <p>Authorising <strong>${machine.replace(/[<&]/g, "")}</strong>.</p>
-   <button id="go">Use passkey</button><p id="status"></p>`,
-  `${CODEC}
-const PORT = ${port};
-const MACHINE = ${JSON.stringify(machine)};
+/**
+ * Approves one machine's sign-in request with the passkey. It may be opened on any computer or phone: the token
+ * goes to the daemon that opened the request, never to this page. `machine` is null once the request expired
+ * or was claimed.
+ */
+export const approvePage = (input: { readonly requestId: string; readonly machine: string | null }): Response => input.machine === null
+  ? shell("Sign-in expired", `<h1>This sign-in has expired</h1><p>Run <code>skill-sync login</code> again on the computer you are signing in.</p>`, "")
+  : shell(
+    "Sign in a computer",
+    `<h1>Sign in to skill sync</h1>
+     <p>Signing in <strong>${escapeHtml(input.machine)}</strong>. Approve only if you just ran <code>skill-sync login</code> on it.</p>
+     <button id="go">Approve with passkey</button><p id="status"></p>`,
+    `${CODEC}
+const REQUEST = ${JSON.stringify(input.requestId)};
 document.getElementById("go").onclick = async () => {
   try {
-    const result = await signIn(MACHINE);
-    // Straight to the waiting CLI on this machine. The token never goes to an address the request chose.
-    say("Signed in. Handing the token to the CLI…");
-    await fetch("http://127.0.0.1:" + PORT + "/?token=" + encodeURIComponent(result.token), { mode: "no-cors" });
-    say("Done. Opening the dashboard…");
-    location.href = "/";
+    await signIn(REQUEST);
+    say("Approved. The computer signs in within a few seconds. Opening the dashboard…");
+    setTimeout(() => { location.href = "/"; }, 1500);
   } catch (error) { say(String(error.message ?? error)); }
 };`,
-);
+  );
+
+const escapeHtml = (text: string): string => text.replace(/[<>&"]/g, (character) => `&#${character.charCodeAt(0)};`);
 
 /** The dashboard's front door when there is no session. */
 export const signInPage = (): Response => shell(
@@ -143,12 +148,15 @@ document.getElementById("go").onclick = async () => {
 );
 
 /**
- * The dashboard, top to bottom: the skills every enabled folder shares, and a tree of computers → skills
- * folders (Claude's, Codex's and Grok's) → skills → files, each folder and skill with its checkbox. Above
- * them, a table of every Claude, Codex and Grok account on the running computers (`renderAccounts`).
+ * The dashboard, in three tabs kept in the address's hash so a reload stays on one:
+ * - Accounts: a table of every Claude, Codex and Grok account on the running computers (`renderAccounts`).
+ * - Skills & computers: the skills every enabled folder shares, and a tree of computers → skills folders (Claude's,
+ *   Codex's and Grok's), each folder one line with its checkbox and counts, opening to its skills and their files.
+ * - Skill refinement: each computer's skill refinement workflow, drawn by `@jive-sh/workflow-platform`'s dashboard
+ *   (`client/refinement-tab.tsx`, bundled to `/refinement.js` and loaded when the tab first opens).
  *
  * Fed by one WebSocket that receives a full snapshot on every change, so the page never has to reconcile
- * partial updates. Built with DOM calls rather than HTML strings: machine names, paths and skill names
+ * partial updates; each computer's refinement report comes on it separately, as it changes. Built with DOM calls rather than HTML strings: machine names, paths and skill names
  * come from outside, and none of it should be able to inject markup here.
  */
 export const dashboardPage = (version: string): Response => new Response(
@@ -175,7 +183,7 @@ export const dashboardPage = (version: string): Response => new Response(
  .rename{font-size:.75rem;padding:.05rem .5rem;margin-left:.2rem}
  .head input{font:inherit;font-size:1rem;padding:.1rem .3rem;border-radius:.3rem;border:1px solid var(--line);background:var(--bg);color:inherit}
  .dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--muted);display:inline-block;align-self:center}
- .online>.head .dot{background:var(--ok)}
+ .machine.online .head .dot{background:var(--ok)}
  .machine>.head{font-weight:600;font-size:1.05rem}
  .folder{border-top:1px solid var(--line);padding:.6rem 0 .3rem}
  .skills{margin:.4rem 0 0 1.6rem}
@@ -197,13 +205,20 @@ export const dashboardPage = (version: string): Response => new Response(
  table.usage tr.machine-use td:first-child{padding-left:3rem}
  table.usage tbody{border-bottom:1px solid var(--line)} table.usage tbody:last-child{border-bottom:none}
  .machine-use.online .dot{background:var(--ok)}
+ nav.tabs{display:flex;gap:.2rem;border-bottom:1px solid var(--line);margin-bottom:1.2rem}
+ nav.tabs button{border:none;border-bottom:3px solid transparent;border-radius:0;font-size:.95rem;padding:.45rem .9rem;color:var(--muted)}
+ nav.tabs button[aria-selected="true"]{border-bottom-color:currentColor;color:var(--fg);font-weight:600}
+ .folder>details>summary{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}
  #accounts{overflow-x:auto} .nowrap{white-space:nowrap}
 </style></head><body><main>
 <header><h1>Skill sync</h1><span id="live" class="small muted">connecting…</span><span id="published" class="small muted"></span>
 <form method="post" action="/logout"><button>Sign out</button></form></header>
-<h2>Accounts</h2><div id="accounts"></div>
-<h2>Synced skills</h2><div id="skills"></div>
-<h2>Computers</h2><div id="machines"></div>
+<nav class="tabs" role="tablist">
+ <button role="tab" data-tab="accounts">Accounts</button><button role="tab" data-tab="computers">Skills &amp; computers</button><button role="tab" data-tab="refinement">Skill refinement</button>
+</nav>
+<section id="tab-accounts" role="tabpanel"><div id="accounts"></div></section>
+<section id="tab-computers" role="tabpanel" hidden><h2>Synced skills</h2><div id="skills"></div><h2>Computers</h2><div id="machines"></div></section>
+<section id="tab-refinement" role="tabpanel" hidden><div id="refinement"><p class="empty">Loading…</p></div></section>
 </main><script type="module">
 /** The version that built this page. A snapshot from another version means a deploy happened: reload. */
 const VERSION = ${JSON.stringify(version)};
@@ -304,9 +319,13 @@ function renderMachines(shared) {
         box.onchange = () => socket?.send(JSON.stringify({ type: "setFolder", machine: machine.machine, path: folder.path, enabled: box.checked }));
         const synced = folder.skills.filter((skill) => skill.synced);
         const local = folder.skills.filter((skill) => !skill.synced);
-        return el("div", { class: "folder" },
-          el("div", { class: "row" }, box, el("span", { class: "mono", title: folder.path }, tilde(folder.path)), el("span", { class: "state " + tone }, text)),
-          folder.lastActivity ? el("div", { class: "muted small", style: "margin-left:1.6rem" }, folder.lastActivity + " · " + ago(folder.lastActivityAt)) : null,
+        const differ = synced.filter((skill) => skill.local && differsFromShared(skill, shared)).length;
+        // One line per folder: its checkbox, where it is, its state and its counts; its skills and files open below it.
+        return el("div", { class: "folder" }, details(machine.machine + "|" + folder.path,
+          [box, el("span", { class: "mono", title: folder.path }, tilde(folder.path)), el("span", { class: "state " + tone }, text),
+            el("span", { class: "muted small" }, synced.length + " synced · " + local.length + " not synced"),
+            differ > 0 ? el("span", { class: "warn small" }, "△ " + differ + " differ" + (differ === 1 ? "s" : "")) : null,
+            folder.lastActivity ? el("span", { class: "muted small", title: folder.lastActivity }, "last change " + stamp(folder.lastActivityAt)) : null],
           folder.enabled ? el("div", { class: "skills" },
             // Synced open, not synced closed: the second is usually the long list. Ticking a skill moves
             // it across once the hub confirms, because both lists are rebuilt from every snapshot.
@@ -315,7 +334,7 @@ function renderMachines(shared) {
               ...synced.map(skillRow)),
             section(machine.machine + "|" + folder.path + "|local", false,
               [el("strong", {}, "Not synced"), " ", el("span", { class: "muted small" }, "(" + local.length + ")")],
-              ...local.map(skillRow))) : null);
+              ...local.map(skillRow))) : el("p", { class: "empty" }, "Tick the folder to sync its skills.")));
 
         function skillRow(skill) {
           const [label, kind] = skillBadge(skill);
@@ -331,6 +350,12 @@ function renderMachines(shared) {
         }
       }))));
 }
+
+/** True when a folder's copy of a synced skill has a file whose hash is not the synced one. */
+const differsFromShared = (skill, shared) => {
+  const reference = new Map((shared.get(skill.name)?.files ?? []).map((file) => [file.path, file.hash]));
+  return skill.files.some((file) => file.hash && reference.has(file.path) && reference.get(file.path) !== file.hash);
+};
 
 /** How long until a time, to the two largest units: "2 d 4 h", "3 h 12 min", "5 min". */
 const until = (at) => {
@@ -517,14 +542,51 @@ function render() {
   renderMachines(shared);
 }
 
+/** Each computer's last skill refinement report, by machine, and the Skill refinement tab's listeners. */
+const refinements = new Map();
+const refinementListeners = new Set();
+const refinementChanged = () => { for (const listener of refinementListeners) listener(); };
+/** What the Skill refinement tab (/refinement.js) reads; it holds no connection of its own. */
+window.skillSyncRefinement = {
+  current: () => ({ refinements: [...refinements.values()].sort((a, b) => nameOf(a.machine).localeCompare(nameOf(b.machine))), machines: snapshot?.machines ?? [] }),
+  subscribe: (listener) => { refinementListeners.add(listener); return () => refinementListeners.delete(listener); },
+  setLimit: async (machine, change) => {
+    if (socket?.readyState !== WebSocket.OPEN) throw new Error("this page is not connected; it reconnects by itself");
+    if (!onlineMachines().has(machine)) throw new Error(nameOf(machine) + " is offline");
+    socket.send(JSON.stringify({ type: "setLimit", machine, workflow: change.workflow, limit: change.limit, value: change.value }));
+  },
+};
+
+const TABS = ["accounts", "computers", "refinement"];
+let refinementLoaded = false;
+/** Shows the tab the address names, the first one when it names none; the Skill refinement tab's code loads the first time. */
+function showTab() {
+  const tab = TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : TABS[0];
+  for (const name of TABS) {
+    document.getElementById("tab-" + name).hidden = name !== tab;
+    document.querySelector("[data-tab='" + name + "']").setAttribute("aria-selected", String(name === tab));
+  }
+  if (tab === "refinement" && !refinementLoaded) {
+    refinementLoaded = true;
+    document.head.append(el("link", { rel: "stylesheet", href: "/refinement.css?v=" + encodeURIComponent(VERSION) }));
+    import("/refinement.js?v=" + encodeURIComponent(VERSION)).catch((error) => {
+      document.getElementById("refinement").replaceChildren(el("p", { class: "warn" }, "The Skill refinement tab could not load: " + (error?.message ?? error)));
+    });
+  }
+}
+for (const button of document.querySelectorAll("nav.tabs button")) button.onclick = () => { location.hash = button.dataset.tab; };
+window.addEventListener("hashchange", showTab);
+showTab();
+
 function connect() {
   socket = new WebSocket(location.origin.replace(/^http/, "ws") + "/dashboard/live");
   socket.onopen = () => { retry = 1000; const live = document.getElementById("live"); live.textContent = "● live"; live.classList.add("on"); };
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
+    if (message.type === "refinement") { refinements.set(message.machine, message); refinementChanged(); return; }
     if (message.type !== "snapshot") return;
     if (message.version !== VERSION && reloadAllowed()) { location.reload(); return; }
-    snapshot = message; render();
+    snapshot = message; render(); refinementChanged();
   };
   socket.onclose = () => {
     const live = document.getElementById("live"); live.textContent = "reconnecting…"; live.classList.remove("on");

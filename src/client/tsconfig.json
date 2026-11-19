@@ -1,0 +1,27 @@
+{
+  "//": [
+    "The dashboard tab's browser code, bundled with React by `build:client`; the Worker's own code is checked by the root tsconfig.json.",
+    "It sits here because Bun's bundler, like tsc, takes `paths` from the tsconfig nearest the importing file.",
+    "`@jive-sh/workflow-platform` ships its dashboard as source its exports leave out, so both of its files are named by path,",
+    "as the platform's README says hosts do until its build exports them."
+  ],
+  "compilerOptions": {
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true,
+    "types": ["bun"],
+    "paths": {
+      "@jive-sh/workflow-platform/dashboard": ["../../node_modules/@jive-sh/workflow-platform/src/dashboard/index.tsx"],
+      "@jive-sh/workflow-platform/dashboard/dashboard.css": ["../../node_modules/@jive-sh/workflow-platform/src/dashboard/dashboard.css"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}

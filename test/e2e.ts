@@ -64,7 +64,12 @@ async function serverFiles() {
 const cookie = (await fetch(`${E}/dev/session?token=${T}`, { redirect: "manual" })).headers.get("set-cookie")!.split(";")[0];
 const snapshots: any[] = [];
 const dashboard = new WebSocket(`${E.replace("http", "ws")}/dashboard/live`, { headers: { cookie, origin: E } } as any);
-dashboard.onmessage = (event) => snapshots.push(JSON.parse(event.data as string));
+/** Each computer's refinement reports, which come beside the snapshots. */
+const refinementReports: any[] = [];
+dashboard.onmessage = (event) => {
+  const message = JSON.parse(event.data as string);
+  (message.type === "refinement" ? refinementReports : snapshots).push(message);
+};
 await new Promise((resolve) => (dashboard.onopen = resolve));
 const tick = async (skill: string, synced: boolean) => {
   dashboard.send(JSON.stringify({ type: "setSkill", skill, synced }));
@@ -203,21 +208,25 @@ const fromCli = {
     { name: "5-hour", minutes: 300, usedPercent: 48, resetsAt: t0 + 3_600_000 },
     { name: "weekly Fable", minutes: 10080, usedPercent: 0, resetsAt: null },
   ] },
-  local: { state: "spend", asOf: t0, periodDays: 30, spent: { amountMinor: 87488, currency: "USD", exponent: 2 }, sessions: 67, partial: false, provider: null },
+  // Session w1 ran on A; w2 ran on A and was later resumed on B.
+  local: { state: "spend", periodDays: 30, currency: "USD", exponent: 6, partial: false, provider: null, sessions: [
+    { id: "w1", amount: 800_000_000, lastActiveAt: t0 },
+    { id: "w2", amount: 74_880_000, lastActiveAt: t0 },
+  ] },
 };
 const bedrock = {
   tool: "claude", home: ".claude-bedrock", identity: null, limits: { state: "none", reason: "Amazon Bedrock has no plan limits" },
-  local: { state: "spend", asOf: t0, periodDays: 30, spent: { amountMinor: 475, currency: "USD", exponent: 2 }, sessions: 2, partial: false, provider: "bedrock" },
+  local: { state: "spend", periodDays: 30, currency: "USD", exponent: 6, partial: false, provider: "bedrock", sessions: [{ id: "b1", amount: 4_750_000, lastActiveAt: t0 }] },
 };
 const codexSaved = {
   tool: "codex", home: ".codex-team", identity: null,
   limits: { state: "reading", asOf: 1793019227405, source: "saved", cliFailure: "`codex` was not found", windows: [{ name: "5-hour", minutes: 300, usedPercent: 24, resetsAt: null }],
     spent: { used: { amountMinor: 100, currency: "USD", exponent: 2 }, limit: null } },
-  local: { state: "tokens", periodDays: 30, count: 288165427, sessions: 3 },
+  local: { state: "tokens", periodDays: 30, sessions: [{ id: "c1", amount: 288_000_000, lastActiveAt: t0 }, { id: "c2", amount: 165_427, lastActiveAt: t0 }] },
 };
 const grokSpend = {
   tool: "grok", home: ".grok", identity: null, limits: { state: "none", reason: "only in Grok's interactive /usage" },
-  local: { state: "spend", asOf: 1793019227405, periodDays: 30, spent: { amountMinor: 137, currency: "USD", exponent: 2 }, sessions: 1, partial: false, provider: null },
+  local: { state: "spend", periodDays: 30, currency: "USD", exponent: 6, partial: false, provider: null, sessions: [{ id: "g1", amount: 1_370_000, lastActiveAt: 1793019227405 }] },
 };
 const unknownCodex = { tool: "codex", home: ".codex", identity: null, limits: { state: "unknown", reason: "Codex's rate-limit record changed shape" }, local: { state: "none" } };
 daemonA.send(JSON.stringify({ type: "usage", accounts: [
@@ -231,14 +240,18 @@ daemonA.send(JSON.stringify({ type: "usage", accounts: [
   { ...fromCli, home: ".claude-bad-asof", limits: { ...fromCli.limits, asOf: "yesterday" } },
   { ...fromCli, home: ".claude-bad-source", limits: { ...fromCli.limits, source: "guess" } },
   { ...fromCli, home: ".claude-bad-identity", identity: { id: 1, email: "x", plan: null } },
-  { ...codexSaved, home: ".codex-bad-tokens", local: { ...codexSaved.local, count: "lots" } },
+  { ...codexSaved, home: ".codex-bad-tokens", local: { ...codexSaved.local, sessions: "lots" } },
+  // The shape daemons before 0.7.0 sent: one total and a count of sessions.
+  { ...fromCli, home: ".claude-totals", local: { state: "spend", asOf: t0, periodDays: 30, spent: { amountMinor: 87488, currency: "USD", exponent: 2 }, sessions: 67, partial: false, provider: null } },
   { ...bedrock, home: ".claude-bad-provider", local: { ...bedrock.local, provider: "vertex" } },
   { tool: "gemini", home: ".gemini", identity: null, limits: { state: "none", reason: "" }, local: { state: "none" } },
 ] }));
 await Bun.sleep(500);
 const sentByA = () => accounts().flatMap((a) => a.machines).filter((m: any) => m.machine === "A").map((m: any) => m.usage);
 check("a daemon's accounts are kept, malformed and old-shape entries dropped",
-  Bun.deepEquals(sentByA().sort((a: any, b: any) => a.home.localeCompare(b.home)), [bedrock, fromCli, unknownCodex, codexSaved, grokSpend].sort((a, b) => a.home.localeCompare(b.home))), sentByA());
+  Bun.deepEquals(sentByA().map((usage: any) => usage.home).sort(), [bedrock, fromCli, unknownCodex, codexSaved, grokSpend].map((usage) => usage.home).sort()), sentByA());
+check("a machine's sessions are added up for it", Bun.deepEquals(sentByA().find((usage: any) => usage.home === ".claude-work")?.local,
+  { state: "spend", asOf: t0, periodDays: 30, spent: { amountMinor: 874_880_000, currency: "USD", exponent: 6 }, sessions: 2, partial: false, provider: null }), sentByA());
 check("an account its tool names is keyed by email", account("claude", "email", "work@example.com")?.machines.length === 1, accounts());
 check("an account its tool cannot name is one folder on one machine, unidentified",
   account("grok", "unidentified", ".grok")?.key.machine === "A" && account("claude", "unidentified", ".claude-bedrock")?.tool === "claude", accounts());
@@ -247,7 +260,13 @@ check("an account its tool cannot name is one folder on one machine, unidentifie
 const fromCliOnB = {
   ...fromCli, home: ".claude",
   limits: { ...fromCli.limits, asOf: t0 + 60_000, windows: [{ name: "5-hour", minutes: 300, usedPercent: 60, resetsAt: t0 + 3_600_000 }] },
-  local: { ...fromCli.local, asOf: t0 + 60_000, spent: { amountMinor: 12_512, currency: "USD", exponent: 2 }, sessions: 3 },
+  local: { ...fromCli.local, sessions: [
+    // w1's file copied from A: the same session, the same last activity.
+    { id: "w1", amount: 800_000_000, lastActiveAt: t0 },
+    // w2 resumed here: its cost covers the whole session.
+    { id: "w2", amount: 90_000_000, lastActiveAt: t0 + 60_000 },
+    { id: "w3", amount: 125_120_000, lastActiveAt: t0 + 60_000 },
+  ] },
 };
 const unreadableOnB = { ...codexSaved, identity: { id: "dev@example.com", email: "dev@example.com", plan: null }, home: ".codex", local: { state: "unknown", reason: "could not read" } };
 const tokensOnA = { ...codexSaved, identity: { id: "dev@example.com", email: "dev@example.com", plan: null }, home: ".codex-dev" };
@@ -257,17 +276,20 @@ await Bun.sleep(500);
 const work = account("claude", "email", "work@example.com");
 check("the same email on two machines is one account, listing both", Bun.deepEquals(work?.machines.map((m: any) => m.machine), ["A", "B"]), work);
 check("its limits are the freshest reading", work?.limits.asOf === t0 + 60_000 && work?.limits.windows[0].usedPercent === 60, work?.limits);
-check("its local use is both machines' added up", work?.localTotal.state === "spend" && work?.localTotal.spent.amountMinor === 87488 + 12_512
-  && work?.localTotal.sessions === 70 && work?.localTotal.partial === false, work?.localTotal);
+check("its local use counts each session once across machines", work?.localTotal.state === "spend" && work?.localTotal.spent.amountMinor === 800_000_000 + 90_000_000 + 125_120_000
+  && work?.localTotal.sessions === 3 && work?.localTotal.partial === false, work?.localTotal);
+const workOn = (machine: string) => work?.machines.find((m: any) => m.machine === machine)?.usage.local;
+check("a copied session counts on the machine that reported it first", workOn("A")?.spent.amountMinor === 800_000_000 && workOn("A")?.sessions === 1, workOn("A"));
+check("a resumed session counts on the machine where it was last active", workOn("B")?.spent.amountMinor === 90_000_000 + 125_120_000 && workOn("B")?.sessions === 2, workOn("B"));
 const dev = account("codex", "email", "dev@example.com");
-check("a machine whose use could not be read makes the total a lower bound", dev?.localTotal.state === "tokens" && dev?.localTotal.count === codexSaved.local.count
+check("a machine whose use could not be read makes the total a lower bound", dev?.localTotal.state === "tokens" && dev?.localTotal.count === 288_165_427
   && dev?.localTotal.partial === true, dev?.localTotal);
 check("each machine's reading says when it was sent", work?.machines.every((m: any) => typeof m.reportedAt === "number" && m.reportedAt >= t0), work?.machines);
 
 daemonA.close();
 await Bun.sleep(500);
 check("an offline machine shows no version", machineView("A")?.online === false && machineView("A")?.daemonVersion === null, machineView("A"));
-check("an offline machine's readings stay", account("grok", "unidentified", ".grok")?.machines[0].usage.local.spent.amountMinor === 137
+check("an offline machine's readings stay", account("grok", "unidentified", ".grok")?.machines[0].usage.local.spent.amountMinor === 1_370_000
   && account("claude", "email", "work@example.com")?.machines.length === 2, accounts());
 
 // A folder a machine stops sending is gone from it.
@@ -314,6 +336,114 @@ check("a folder no longer reported is gone", Bun.deepEquals(machineView("C")?.fo
 await reportC([{ path: "/c/one", skills: [x2] }, { path: "/c/two", skills: [] }]);
 check("a folder that comes back is new: unticked, its old skills gone", Bun.deepEquals(localOnC("/c/two"), [])
   && machineView("C")?.folders.find((f: any) => f.path === "/c/two")?.enabled === false, machineView("C"));
+
+// Signing a machine in through a sign-in request, with the daemon's own calls: the page approves, only the claim
+// secret collects the token, once. /dev/approve stands in for the passkey, which needs a real authenticator.
+const { openSignInRequest, claimSignInRequest } = await import(`${SS}/server.ts`);
+const opened = await openSignInRequest({ endpoint: E, machine: "D" });
+const requestId = new URL(opened.url).searchParams.get("request");
+// wrangler dev serves this service as its production host, so the page is fetched from the local copy by path.
+const approvePageHere = `${E}/approve?request=${requestId}`;
+check("a sign-in request gives a page on this service and a claim secret", new URL(opened.url).pathname === "/approve" && requestId !== null
+  && typeof opened.claimSecret === "string" && !opened.url.includes(opened.claimSecret), opened.url);
+check("the page names the machine it signs in", (await (await fetch(approvePageHere)).text()).includes("Signing in <strong>D</strong>"));
+check("before approval the claim is pending", (await claimSignInRequest({ endpoint: E, claimSecret: opened.claimSecret })).state === "pending");
+check("a wrong secret claims nothing", (await claimSignInRequest({ endpoint: E, claimSecret: "guess" })).state === "expired");
+check("approving needs a passkey", (await fetch(`${E}/dev/approve?request=${requestId}`, { method: "POST" })).status === 401);
+check("approved with the passkey", (await fetch(`${E}/dev/approve?request=${requestId}&token=${T}`, { method: "POST" })).status === 200);
+const claimed = await claimSignInRequest({ endpoint: E, claimSecret: opened.claimSecret });
+check("the claim then carries the machine's token", claimed.state === "approved", claimed.state);
+const issued = claimed.state === "approved" ? claimed.token : "";
+check("the token works for D", (await fetch(`${E}/skills`, { headers: { authorization: `Bearer ${issued}`, "x-skill-sync-machine": "D" } })).status === 200);
+check("and only for D", (await fetch(`${E}/skills`, { headers: { authorization: `Bearer ${issued}`, "x-skill-sync-machine": "E" } })).status === 403);
+check("a request yields its token once", (await claimSignInRequest({ endpoint: E, claimSecret: opened.claimSecret })).state === "expired");
+check("its page then says it expired", (await (await fetch(approvePageHere)).text()).includes("has expired"));
+check("a sign-in request needs a machine name", (await fetch(`${E}/cli/sign-in-requests`, { method: "POST", body: "{}" })).status === 400);
+check("the old 127.0.0.1 hand-off is gone", (await fetch(`${E}/cli/login?port=4000&machine=D`)).status !== 200);
+
+// A token copied from one machine onto another: the service names a machine only from the token's row, and
+// refuses a request from a machine configured as another one, saying whose token it is.
+const { TokenOfAnotherMachine } = await import(`${SS}/server.ts`);
+const { MACHINE_HEADER } = await import(`${SS}/wire.ts`);
+const copied = "token-issued-to-A";
+const inserted = Bun.spawnSync(["bunx", "wrangler", "d1", "execute", "jive-skill-sync-db", "--local", "--persist-to", join(import.meta.dir, "../.e2e/state"),
+  "--command", `INSERT INTO device_tokens (token_hash, machine, created_at) VALUES ('${await sha256(copied)}', 'A', 0)`], { cwd: join(import.meta.dir, "..") });
+check("a token issued to A is stored", inserted.exitCode === 0, inserted.stderr.toString().slice(-300));
+const as = (machine: string) => ({ authorization: `Bearer ${copied}`, [MACHINE_HEADER]: machine, "content-type": "application/json" });
+check("the token works from A", (await fetch(`${E}/skills`, { headers: as("A") })).status === 200);
+const fromB = await fetch(`${E}/skills`, { headers: as("B") });
+const fromBBody = await fromB.json() as { tokenMachine?: string };
+check("from a machine configured as B it is refused, naming A", fromB.status === 403 && fromBBody.tokenMachine === "A", { status: fromB.status, fromBBody });
+check("a request that names no machine is refused too", (await fetch(`${E}/skills`, { headers: { authorization: `Bearer ${copied}` } })).status === 403);
+const copiedWrite = await fetch(`${E}/files`, {
+  method: "PUT", headers: as("B"),
+  body: JSON.stringify({ path: "copied/SKILL.md", hash: await sha256("c"), content: btoa("c"), editedAt: Date.now() }),
+});
+check("a write from B with A's token is refused and not stored",
+  copiedWrite.status === 403 && !(await serverFiles()).some((file) => file.path === "copied/SKILL.md"), copiedWrite.status);
+const copiedRevoke = await fetch(`${E}/cli/token`, { method: "DELETE", headers: as("B") });
+check("B cannot revoke A's token", copiedRevoke.status === 403 && (await fetch(`${E}/skills`, { headers: as("A") })).status === 200, copiedRevoke.status);
+const copiedSocket = new WebSocket(`${E.replace("http", "ws")}/daemon`, { headers: as("B") } as any);
+const socketOutcome = await new Promise<string>((resolve) => {
+  copiedSocket.onopen = () => resolve("open");
+  copiedSocket.onerror = () => resolve("refused");
+});
+check("B's daemon cannot connect to the hub with A's token", socketOutcome === "refused", socketOutcome);
+const wroteAsA = await fetch(`${E}/files`, {
+  method: "PUT", headers: as("A"),
+  body: JSON.stringify({ path: "owned/SKILL.md", hash: await sha256("o"), content: btoa("o"), editedAt: Date.now(), machine: "Z" }),
+});
+const owned = ((await (await fetch(`${E}/files?since=0`, { headers: as("A") })).json()).files as { path: string; updatedBy: string }[])
+  .find((file) => file.path === "owned/SKILL.md");
+check("an edit is recorded as the token's machine's, whatever the body says", wroteAsA.status === 200 && owned?.updatedBy === "A", owned);
+const copiedDaemon = await syncOnce({ endpoint: E, token: copied, machine: "B", exclude: [] }, folders.B, { cursor: 0, known: {} }, new Set(["foo"]))
+  .then(() => undefined, (cause: unknown) => cause);
+check("B's daemon learns the token is A's", copiedDaemon instanceof TokenOfAnotherMachine && copiedDaemon.tokenMachine === "A" && copiedDaemon.configuredMachine === "B", String(copiedDaemon));
+
+// Skill refinement: a daemon's report is stored and passed to every open dashboard, kept while its machine is offline and
+// sent to a page opened later; a limit set on the page reaches that machine's daemon and no other.
+const reportsOf = (machine: string) => refinementReports.filter((report) => report.machine === machine);
+const limitsTo = (ws: WebSocket) => {
+  const received: any[] = [];
+  ws.onmessage = (event) => { const message = JSON.parse(String(event.data)); if (message.type === "setLimit") received.push(message); };
+  return received;
+};
+const daemonR = await daemon("R");
+const daemonS = await daemon("S");
+const limitsToR = limitsTo(daemonR);
+const limitsToS = limitsTo(daemonS);
+const figuresOfR = { name: "Skill refinement", hours: 24, steps: [] };
+const pageData = { view: { at: 1, groups: [] }, runsNow: [], cpu: { limit: 4, use: null }, figures: { "Skill refinement": figuresOfR } };
+daemonR.send(JSON.stringify({ type: "refinement", refinement: { state: "running", data: pageData } }));
+daemonS.send(JSON.stringify({ type: "refinement", refinement: { state: "notRunning", reason: "this machine has no copy of the autonomous-skill-refinement skill" } }));
+await Bun.sleep(500);
+check("a running workflow's report reaches the dashboard as the daemon sent it",
+  JSON.stringify(reportsOf("R").at(-1)?.refinement) === JSON.stringify({ state: "running", data: pageData }), reportsOf("R").at(-1));
+check("a machine that runs no workflow says why", reportsOf("S").at(-1)?.refinement.reason === "this machine has no copy of the autonomous-skill-refinement skill", reportsOf("S").at(-1));
+daemonR.send(JSON.stringify({ type: "refinement", refinement: { state: "running", data: { view: "not an object" } } }));
+await Bun.sleep(500);
+check("a report not in the dashboard's shape is dropped", reportsOf("R").length === 1, reportsOf("R").length);
+const figuresRoute = (query: Record<string, string>, headers: Record<string, string>) => fetch(`${E}/dashboard/refinement-figures?${new URLSearchParams(query)}`, { headers });
+const figuresRead = await figuresRoute({ machine: "R", workflow: "Skill refinement" }, { cookie });
+check("an opened workflow's figures are served as its machine reported them", figuresRead.status === 200 && JSON.stringify(await figuresRead.json()) === JSON.stringify(figuresOfR), figuresRead.status);
+check("a workflow the machine did not report has no figures", (await figuresRoute({ machine: "R", workflow: "toString" }, { cookie })).status === 404);
+check("a machine whose workflow is not running has no figures", (await figuresRoute({ machine: "S", workflow: "Skill refinement" }, { cookie })).status === 404);
+check("figures are served only to a signed-in page", (await figuresRoute({ machine: "R", workflow: "Skill refinement" }, {})).status === 401);
+dashboard.send(JSON.stringify({ type: "setLimit", machine: "R", workflow: "Skill refinement", limit: "agents", value: 2 }));
+await Bun.sleep(500);
+check("a limit set on the page reaches that machine's daemon", JSON.stringify(limitsToR) === JSON.stringify([{ type: "setLimit", workflow: "Skill refinement", limit: "agents", value: 2 }]), limitsToR);
+check("and no other machine's", limitsToS.length === 0, limitsToS);
+daemonR.close();
+await Bun.sleep(500);
+const laterReports: any[] = [];
+const laterPage = new WebSocket(`${E.replace("http", "ws")}/dashboard/live`, { headers: { cookie, origin: E } } as any);
+laterPage.onmessage = (event) => { const message = JSON.parse(event.data as string); if (message.type === "refinement") laterReports.push(message); };
+await new Promise((resolve) => (laterPage.onopen = resolve));
+await Bun.sleep(500);
+check("a page opened later gets each machine's last report, an offline machine's included",
+  laterReports.map((report) => `${report.machine}:${report.refinement.state}`).sort().join(",") === "R:running,S:notRunning", laterReports);
+laterPage.close();
+daemonS.close();
 
 dashboard.close();
 console.log(failed === 0 ? "all passed" : `${failed} failed`);

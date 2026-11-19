@@ -5,8 +5,9 @@ import {
   verifyRegistrationResponse,
 } from "@simplewebauthn/server";
 import type { Env } from "./env";
-import { createSession, randomToken } from "./session";
-import { json, sha256Hex } from "./util";
+import { createSession } from "./session";
+import { approveSignInRequest } from "./sign-in-requests";
+import { json } from "./util";
 
 /**
  * Passkey sign-in, with registration that closes behind itself.
@@ -16,8 +17,8 @@ import { json, sha256Hex } from "./util";
  * off. Losing every passkey means clearing that table by hand, which is the correct amount of friction
  * for re-opening registration.
  *
- * The browser never receives a long-lived credential. It proves possession of the passkey and gets a
- * device token in exchange, which is what the daemon then uses; the passkey itself never leaves the
+ * The browser never receives a long-lived credential. It proves possession of the passkey, which approves a
+ * machine's sign-in request; the daemon that opened the request claims the device token (`sign-in-requests.ts`); the passkey itself never leaves the
  * authenticator.
  */
 
@@ -108,14 +109,12 @@ export async function loginOptions(request: Request, env: Env): Promise<Response
 }
 
 /**
- * Verifies the assertion, opens a dashboard session in this browser, and — when a machine is signing
- * in — mints that machine's token.
- *
- * The machine token is returned to the page, which hands it to a listener on 127.0.0.1 — never to an
- * address the request supplied, so a page that tricks you into signing in cannot collect it.
+ * Verifies the assertion, opens a dashboard session in this browser, and, when it answers a machine's sign-in
+ * request, approves that request. The machine's token goes only to the daemon that holds the request's claim
+ * secret (`claimSignInRequest`), never to this page.
  */
 export async function loginVerify(request: Request, env: Env): Promise<Response> {
-  const body = await request.json() as { response?: unknown; challenge?: unknown; machine?: unknown };
+  const body = await request.json() as { response?: unknown; challenge?: unknown; request?: unknown };
   if (typeof body.challenge !== "string" || !(await consumeChallenge(env, body.challenge, "login"))) {
     return json({ error: "unknown or expired challenge" }, 400);
   }
@@ -145,19 +144,13 @@ export async function loginVerify(request: Request, env: Env): Promise<Response>
     .bind(verified.authenticationInfo.newCounter, stored.credential_id).run();
 
   const session = await createSession(env);
-  if (typeof body.machine !== "string") {
-    return new Response(JSON.stringify({ ok: true }), {
-      headers: { "content-type": "application/json", "set-cookie": session },
-    });
+  const headers = { "content-type": "application/json", "set-cookie": session };
+  if (typeof body.request !== "string") return new Response(JSON.stringify({ ok: true }), { headers });
+  const machine = await approveSignInRequest(env, body.request);
+  if (machine === undefined) {
+    return new Response(JSON.stringify({ error: "this sign-in request has expired; run skill-sync login again" }), { status: 410, headers });
   }
-
-  const token = randomToken();
-  await env.DB
-    .prepare("INSERT INTO device_tokens (token_hash, machine, created_at) VALUES (?, ?, ?)")
-    .bind(await sha256Hex(token), body.machine, Date.now()).run();
-  return new Response(JSON.stringify({ token }), {
-    headers: { "content-type": "application/json", "set-cookie": session },
-  });
+  return new Response(JSON.stringify({ ok: true, machine }), { headers });
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

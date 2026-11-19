@@ -1,13 +1,14 @@
 import {
   invalidPathReason, isSkillName, skillOf, type FoldersRequest, type FoldersResponse, type ListFilesResponse, type ListSkillsResponse,
-  type PutFileRequest,
+  type MachineMismatch, type PutFileRequest, MACHINE_HEADER, MACHINE_MISMATCH_STATUS,
 } from "@jive-sh/skill-sync";
 import { loginOptions, loginVerify, registerOptions, registerVerify } from "./auth";
 import type { Env } from "./env";
-import type { SnapshotTable } from "./hub";
-import { dashboardPage, loginPage, registerPage, signInPage } from "./pages";
+import { refinementFigures, type SnapshotTable } from "./hub";
+import { approvePage, dashboardPage, registerPage, signInPage } from "./pages";
 import { prefsFor, SKILL_OF_PATH } from "./prefs";
 import { devSessionCookie, endSession, hasSession } from "./session";
+import { approveSignInRequest, claimSignInRequest, createSignInRequest, openSignInRequest } from "./sign-in-requests";
 import { json, sha256Bytes, sha256Hex } from "./util";
 
 export { Hub } from "./hub";
@@ -15,10 +16,10 @@ export { Hub } from "./hub";
 /**
  * The service behind skill-sync: a file index in D1, file contents in R2 addressed by hash.
  *
- * Two kinds of caller, two kinds of credential. A browser proves a passkey and walks away with a device
- * token for the machine and a session for itself; the daemon presents that token on every request. The
- * daemon cannot do a passkey ceremony — it has no browser and nobody is watching it — which is the whole
- * reason the exchange exists. Live connections (daemons and dashboards) go to the `Hub` Durable Object.
+ * Two kinds of caller, two kinds of credential. A browser proves a passkey, which opens a session for itself and
+ * approves a machine's sign-in request; the machine's daemon claims its device token (`sign-in-requests.ts`) and
+ * presents it on every request. The daemon cannot do a passkey ceremony — it may have no browser, and nobody is
+ * watching it — which is the whole reason the exchange exists. Live connections (daemons and dashboards) go to the `Hub` Durable Object.
  */
 
 interface FileRow {
@@ -40,7 +41,13 @@ export default {
       if (method === "GET" && path === "/register") return registerPage(await isClaimed(env));
       if (method === "POST" && path === "/register/options") return await registerOptions(request, env);
       if (method === "POST" && path === "/register/verify") return await registerVerify(request, env);
-      if (method === "GET" && path === "/cli/login") return cliLogin(url);
+      // A machine signing in: the daemon opens and claims a request; a passkey on any computer approves it.
+      if (method === "POST" && path === "/cli/sign-in-requests") return await createSignInRequest(request, env);
+      if (method === "POST" && path === "/cli/sign-in-requests/claim") return await claimSignInRequest(request, env);
+      if (method === "GET" && path === "/approve") {
+        const requestId = url.searchParams.get("request") ?? "";
+        return approvePage({ requestId, machine: (await openSignInRequest(env, requestId))?.machine ?? null });
+      }
       if (method === "POST" && path === "/login/options") return await loginOptions(request, env);
       if (method === "POST" && path === "/login/verify") return await loginVerify(request, env);
 
@@ -50,6 +57,12 @@ export default {
       }
       if (method === "POST" && path === "/logout") {
         return new Response(null, { status: 303, headers: { location: "/", "set-cookie": await endSession(request, env) } });
+      }
+      if (method === "POST" && path === "/dev/approve" && env.DEV_TOKEN) {
+        // Local development only, as /dev/session: approves a sign-in request without a passkey, for the end-to-end test.
+        if (url.searchParams.get("token") !== env.DEV_TOKEN) return json({ error: "unauthorized" }, 401);
+        const machine = await approveSignInRequest(env, url.searchParams.get("request") ?? "");
+        return machine === undefined ? json({ error: "no open request" }, 410) : json({ ok: true, machine });
       }
       if (method === "GET" && path === "/dev/session" && env.DEV_TOKEN) {
         if (url.searchParams.get("token") !== env.DEV_TOKEN) return json({ error: "unauthorized" }, 401);
@@ -62,9 +75,16 @@ export default {
         if (!(await hasSession(request, env))) return json({ error: "unauthorized" }, 401);
         return await toHub(env, request, "dashboard");
       }
+      if (method === "GET" && path === "/dashboard/refinement-figures") {
+        if (!(await hasSession(request, env))) return json({ error: "unauthorized" }, 401);
+        const figures = await refinementFigures(env, url.searchParams.get("machine") ?? "", url.searchParams.get("workflow") ?? "");
+        return figures === undefined ? json({ error: "no figures reported for that machine and workflow" }, 404) : json(figures);
+      }
 
-      const machine = await authorized(request, env);
-      if (machine === null) return json({ error: "unauthorized" }, 401);
+      const caller = await authorized(request, env);
+      if (caller.kind === "unauthorized") return json({ error: "unauthorized" }, 401);
+      if (caller.kind === "anotherMachine") return json(caller.refusal, MACHINE_MISMATCH_STATUS);
+      const { machine } = caller;
 
       if (method === "GET" && path === "/daemon") return await toHub(env, request, "daemon", machine);
       if (method === "POST" && path === "/folders") return await registerFolders(request, env, machine);
@@ -72,7 +92,7 @@ export default {
       if (method === "GET" && path === "/skills") return await listSkills(env);
       if (method === "PUT" && path.startsWith("/skills/")) return await addSkill(path, env);
       if (method === "GET" && path.startsWith("/content/")) return await getContent(path, env);
-      if (method === "PUT" && path === "/files") return await putFile(request, env);
+      if (method === "PUT" && path === "/files") return await putFile(request, env, machine);
       if (method === "DELETE" && path === "/cli/token") return await revokeToken(request, env);
       return json({ error: "not found" }, 404);
     } catch (cause) {
@@ -86,34 +106,44 @@ async function isClaimed(env: Env): Promise<boolean> {
   return (row?.n ?? 0) > 0;
 }
 
-/** The CLI chooses the port it is listening on; nothing else about the redirect is taken from the request. */
-function cliLogin(url: URL): Response {
-  const port = Number(url.searchParams.get("port"));
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-    return json({ error: "port must be an integer between 1024 and 65535" }, 400);
-  }
-  return loginPage(port, url.searchParams.get("machine") ?? "unknown");
-}
+type Caller =
+  | { readonly kind: "machine"; readonly machine: string }
+  | { readonly kind: "unauthorized" }
+  /** The token is valid but was issued to another machine than the one the daemon is configured as. */
+  | { readonly kind: "anotherMachine"; readonly refusal: MachineMismatch };
 
 /**
- * The machine a bearer token belongs to, or null. The machine comes from the token's own row, never from
- * the request, so one machine's token cannot speak for another. Only the local-development token takes
- * the name from a header, since it belongs to no machine.
+ * The machine a bearer token belongs to. The machine comes from the token's own row, never from the request,
+ * so one machine's token cannot speak for another. The daemon names the machine it is configured as in
+ * `MACHINE_HEADER`; when that is not the token's machine (a token file copied from another computer) the
+ * request is refused and told whose token it is, rather than served as the token's machine, which would let
+ * one computer silently overwrite another's folders and readings. Only the local-development token takes the
+ * name from the header, since it belongs to no machine.
  */
-async function authorized(request: Request, env: Env): Promise<string | null> {
+async function authorized(request: Request, env: Env): Promise<Caller> {
   const presented = request.headers.get("authorization")?.replace(/^Bearer /, "");
-  if (!presented) return null;
-  if (env.DEV_TOKEN && presented === env.DEV_TOKEN) return request.headers.get("x-skill-sync-machine") ?? "dev";
+  if (!presented) return { kind: "unauthorized" };
+  const configured = request.headers.get(MACHINE_HEADER);
+  if (env.DEV_TOKEN && presented === env.DEV_TOKEN) return { kind: "machine", machine: configured ?? "dev" };
 
   const row = await env.DB.prepare("SELECT token_hash, machine FROM device_tokens WHERE token_hash = ?")
     .bind(await sha256Hex(presented)).first<{ token_hash: string; machine: string }>();
-  if (row === null) return null;
+  if (row === null) return { kind: "unauthorized" };
+  if (configured !== row.machine) {
+    return {
+      kind: "anotherMachine",
+      refusal: {
+        error: `this token was issued to "${row.machine}", but the request comes from a machine configured as "${configured ?? "(none)"}"`,
+        tokenMachine: row.machine,
+      },
+    };
+  }
 
   // The dashboard shows last_seen only for a machine whose daemon is offline, and the hub stamps it when
   // a daemon disconnects; a daemon makes requests every minute or so, so writing each one is pointless.
   await env.DB.prepare("UPDATE device_tokens SET last_seen = ?1 WHERE token_hash = ?2 AND (last_seen IS NULL OR last_seen < ?1 - ?3)")
     .bind(Date.now(), row.token_hash, LAST_SEEN_INTERVAL_MS).run();
-  return row.machine;
+  return { kind: "machine", machine: row.machine };
 }
 
 /** How stale a token's last_seen may get while it is in use. */
@@ -244,11 +274,11 @@ async function getContent(path: string, env: Env): Promise<Response> {
  * Takes a write only if it was edited later than the version held. A refused write is answered 409 with
  * the version that won, which the daemon applies at once.
  */
-async function putFile(request: Request, env: Env): Promise<Response> {
+async function putFile(request: Request, env: Env, machine: string): Promise<Response> {
   const body = await request.json() as Partial<PutFileRequest>;
-  const { path, machine, editedAt } = body;
-  if (typeof path !== "string" || typeof machine !== "string") {
-    return json({ error: "path and machine are required" }, 400);
+  const { path, editedAt } = body;
+  if (typeof path !== "string") {
+    return json({ error: "path is required" }, 400);
   }
   if (typeof editedAt !== "number" || !Number.isFinite(editedAt)) {
     return json({ error: "editedAt is required; upgrade skill-sync with `skill-sync upgrade`" }, 400);

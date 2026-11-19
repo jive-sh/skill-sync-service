@@ -1,0 +1,23 @@
+name: CI/CD Pipeline
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+# A reusable workflow can only reduce the caller's permissions, never raise them. The deploy job needs
+# id-token:write (the reusable workflow asks for it on every deploy job), so the caller has to grant it here or the whole workflow is
+# rejected before any job starts — a startup_failure with no logs and no annotation to explain it.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pipeline:
+    name: Pipeline
+    uses: jive-sh/jive/.github/workflows/reusable-pipeline.yml@main
+    secrets: inherit

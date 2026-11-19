@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   DAEMON_VERSION_HEADER, skillOf, type AccountUsage, type AddSkillResponse, type MachineAccountReading, type DaemonMessage, type FileHash, type DashboardMessage, type FolderState, type HubToDaemon,
-  type MachineView, type SkillView, type Snapshot, type SyncedSkill,
+  type MachineRefinement, type MachineView, type Refinement, type SkillView, type Snapshot, type SyncedSkill,
 } from "@jive-sh/skill-sync";
 import type { Env } from "./env";
 import { prefsFor } from "./prefs";
-import { accountsFrom, groupAccounts } from "./usage";
+import { accountsFrom, groupAccounts, sessionKey } from "./usage";
 
 /**
  * The one place every live connection meets: each machine's daemon and each open dashboard.
@@ -33,6 +33,8 @@ const DIST_TAGS_URL = "https://registry.npmjs.org/-/package/@jive-sh/skill-sync/
 const PUBLISHED_TTL_MS = 60_000;
 /** After a failed lookup, sooner than that, but not on every snapshot: each one would wait out the timeout. */
 const PUBLISHED_RETRY_MS = 10_000;
+/** Longer than any tool's 30-day period, so a session still counted keeps its first reporter. */
+const SESSION_FIRST_REPORT_KEPT_MS = 45 * 24 * 60 * 60 * 1000;
 
 /**
  * The tables a dashboard snapshot is built from, each with the query that reads it. Every write to one of
@@ -48,6 +50,7 @@ const SNAPSHOT_QUERIES = {
   // Deleted skills stay in the table so daemons delete their copies, but are no longer on the list.
   synced_skills: "SELECT skill FROM synced_skills WHERE deleted_at IS NULL ORDER BY skill",
   account_readings: "SELECT machine, usage, reported_at FROM account_readings",
+  session_first_reports: "SELECT tool, session_id, machine FROM session_first_reports",
 } as const;
 export type SnapshotTable = keyof typeof SNAPSHOT_QUERIES;
 const SNAPSHOT_TABLES = Object.keys(SNAPSHOT_QUERIES) as SnapshotTable[];
@@ -131,6 +134,7 @@ export class Hub extends DurableObject<Env> {
       // A page being opened reads everything, so nothing a write forgot to name can stay stale past a reload.
       this.invalidate(SNAPSHOT_TABLES);
       send(server, await this.snapshot());
+      for (const refinement of await this.refinements()) send(server, refinement);
     }
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -173,8 +177,19 @@ export class Hub extends DurableObject<Env> {
         console.log(`usage from ${attachment.machine} (${attachment.version ?? "version unknown"}): ${usage.length} accounts kept, ${sent - usage.length} dropped; `
           + usage.map(describeUsage).join(", "));
         await this.saveUsage(attachment.machine, usage);
-        this.invalidate(["account_readings"]);
+        this.invalidate(["account_readings", "session_first_reports"]);
         await this.broadcast();
+        return;
+      }
+      if (status.type === "refinement") {
+        const refinement = refinementFrom(status.refinement);
+        if (refinement === undefined) return;
+        const reported: MachineRefinement = { type: "refinement", machine: attachment.machine, reportedAt: Date.now(), refinement };
+        await this.env.DB.prepare(`INSERT INTO machine_refinements (machine, refinement, reported_at) VALUES (?, ?, ?)
+                                    ON CONFLICT(machine) DO UPDATE SET refinement = excluded.refinement, reported_at = excluded.reported_at`)
+          .bind(attachment.machine, JSON.stringify(refinement), reported.reportedAt).run();
+        // Only this machine's part changed, so dashboards get it alone, not a new snapshot.
+        for (const ws of this.ctx.getWebSockets("dashboard")) send(ws, reported);
         return;
       }
       if (status.type !== "status") return;
@@ -202,6 +217,10 @@ export class Hub extends DurableObject<Env> {
     } else if (change.type === "setSkill") {
       await this.setSkill(change.skill, change.synced);
       return;
+    } else if (change.type === "setLimit") {
+      // The daemon applies it and reports its limits again, which is what the dashboard then shows.
+      this.toDaemons(change.machine, { type: "setLimit", workflow: change.workflow, limit: change.limit, value: change.value });
+      return;
     } else if (change.type === "renameMachine") {
       // A name is display only, so nothing goes to the daemon; an empty one restores the machine name.
       const name = change.name.trim().slice(0, 80);
@@ -220,11 +239,20 @@ export class Hub extends DurableObject<Env> {
 
   /**
    * The machine's latest reading of each account, replacing the last one; a folder it no longer sends is
-   * gone from the machine, so its row goes too.
+   * gone from the machine, so its row goes too. Each session it is the first to report is recorded as
+   * first reported by it, which decides where a session copied to another machine counts (`groupAccounts`).
    */
   private async saveUsage(machine: string, usage: ReadonlyArray<AccountUsage>): Promise<void> {
     const now = Date.now();
+    const sessions = usage.flatMap((account) => account.local.state === "spend" || account.local.state === "tokens"
+      ? account.local.sessions.map((session) => ({ tool: account.tool, id: session.id }))
+      : []);
     await this.env.DB.batch([
+      this.env.DB.prepare(`INSERT INTO session_first_reports (tool, session_id, machine, reported_at)
+                            SELECT json_extract(value, '$.tool'), json_extract(value, '$.id'), ?, ? FROM json_each(?) WHERE true
+                            ON CONFLICT(tool, session_id) DO NOTHING`).bind(machine, now, JSON.stringify(sessions)),
+      // Past every tool's period, a session counts nowhere, so who reported it first no longer matters.
+      this.env.DB.prepare("DELETE FROM session_first_reports WHERE reported_at < ?").bind(now - SESSION_FIRST_REPORT_KEPT_MS),
       this.env.DB.prepare("DELETE FROM account_readings WHERE machine = ? AND home NOT IN (SELECT value FROM json_each(?))")
         .bind(machine, JSON.stringify(usage.map((account) => account.home))),
       ...usage.map((account) => this.env.DB.prepare(
@@ -232,6 +260,16 @@ export class Hub extends DurableObject<Env> {
          ON CONFLICT(machine, home) DO UPDATE SET usage = excluded.usage, reported_at = excluded.reported_at`,
       ).bind(machine, account.home, JSON.stringify(account), now)),
     ]);
+  }
+
+  /** Every machine's last refinement report, as dashboards are sent them. */
+  private async refinements(): Promise<ReadonlyArray<MachineRefinement>> {
+    const { results } = await this.env.DB.prepare("SELECT machine, refinement, reported_at FROM machine_refinements ORDER BY machine")
+      .all<{ machine: string; refinement: string; reported_at: number }>();
+    return results.flatMap((row) => {
+      const refinement = refinementFrom(JSON.parse(row.refinement));
+      return refinement === undefined ? [] : [{ type: "refinement" as const, machine: row.machine, reportedAt: row.reported_at, refinement }];
+    });
   }
 
   private connectedMachines(): Set<string> {
@@ -309,9 +347,12 @@ export class Hub extends DurableObject<Env> {
         .map((ws) => ws.deserializeAttachment() as DaemonAttachment)
         .map((attachment) => [attachment.machine, attachment] as const),
     );
-    const { device_tokens: tokens, folders, skills, files, machines: renamed, synced_skills: list, account_readings: readings } = await this.tableRows();
+    const { device_tokens: tokens, folders, skills, files, machines: renamed, synced_skills: list, account_readings: readings, session_first_reports: sessionFirstReports } = await this.tableRows();
+    // Checked again on the way out: a row from a daemon before 0.7.0 holds counts rather than sessions, and is left out.
     const accountReadings: MachineAccountReading[] = (readings as { machine: string; usage: string; reported_at: number }[])
-      .map((row) => ({ machine: row.machine, reportedAt: row.reported_at, usage: JSON.parse(row.usage) as AccountUsage }));
+      .flatMap((row) => accountsFrom([JSON.parse(row.usage)]).map((usage) => ({ machine: row.machine, reportedAt: row.reported_at, usage })));
+    const firstReports = new Map((sessionFirstReports as { tool: AccountUsage["tool"]; session_id: string; machine: string }[])
+      .map((row) => [sessionKey({ tool: row.tool, id: row.session_id }), row.machine] as const));
     const syncedList = (list as { skill: string }[]).map((row) => row.skill);
     const onList = new Set(syncedList);
     const names = new Map((renamed as { machine: string; name: string }[]).map((row) => [row.machine, row.name]));
@@ -355,7 +396,7 @@ export class Hub extends DurableObject<Env> {
       names: Object.fromEntries([...everyName].map((machine) => [machine, names.get(machine) ?? machine])),
       skills: syncedList.map((name) => ({ name, files: synced.get(name) ?? [] })),
       machines,
-      accounts: groupAccounts(accountReadings),
+      accounts: groupAccounts(accountReadings, firstReports),
     };
   }
 
@@ -382,6 +423,32 @@ function describeUsage(account: AccountUsage): string {
     : `limits ${limits.state} (${limits.reason})`;
   const who = account.identity === null ? "unidentified" : account.identity.email;
   return `${account.tool} ${account.home} ${who} ${limitsText} local ${local.state}${local.state === "unknown" ? ` (${local.reason})` : ""}`;
+}
+
+/**
+ * A daemon's refinement report, if it has the shape the dashboard reads: a state, and for a running workflow its page data
+ * and each workflow's figures. They are only displayed, and rendered as text, so their inside is not checked field by field.
+ */
+function refinementFrom(value: unknown): Refinement | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const r = value as { state?: unknown; reason?: unknown; data?: unknown };
+  if (r.state === "notRunning" && typeof r.reason === "string") return { state: "notRunning", reason: r.reason.slice(0, 500) };
+  if (r.state !== "running") return undefined;
+  const d = r.data as { view?: unknown; runsNow?: unknown; figures?: unknown; cpu?: unknown } | null | undefined;
+  if (typeof d !== "object" || d === null || typeof d.view !== "object" || d.view === null || !Array.isArray(d.runsNow)
+    || typeof d.figures !== "object" || d.figures === null || typeof d.cpu !== "object" || d.cpu === null) return undefined;
+  return { state: "running", data: r.data as Extract<Refinement, { state: "running" }>["data"] };
+}
+
+/**
+ * One workflow's figures as a machine last reported them: what `WorkflowsDashboard` reads from its `figuresUrl` when that
+ * workflow is opened. None when the machine has no report, or its workflow is not running or not of that name.
+ */
+export async function refinementFigures(env: Env, machine: string, workflow: string): Promise<object | undefined> {
+  const row = await env.DB.prepare("SELECT refinement FROM machine_refinements WHERE machine = ?").bind(machine).first<{ refinement: string }>();
+  if (row === null) return undefined;
+  const refinement = refinementFrom(JSON.parse(row.refinement));
+  return refinement?.state === "running" && Object.hasOwn(refinement.data.figures, workflow) ? refinement.data.figures[workflow] : undefined;
 }
 
 function send(ws: WebSocket, message: unknown): void {

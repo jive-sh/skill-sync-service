@@ -9,6 +9,9 @@
   "workers_dev": false,
   // The deployed version's id, so an open dashboard can tell it is out of date and reload itself.
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  // The Skill refinement tab's browser bundle (`build:client`), served as files before the Worker runs: it is code, not data,
+  // and every figure it draws still comes over the signed-in dashboard connection.
+  "assets": { "directory": "./public" },
   "d1_databases": [
     { "binding": "DB", "database_name": "jive-skill-sync-db", "database_id": "dfdfeddf-7624-4bb9-84f5-4044c2518736" }
   ],

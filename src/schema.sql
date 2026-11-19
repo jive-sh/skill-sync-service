@@ -109,3 +109,36 @@ CREATE TABLE IF NOT EXISTS account_readings (
   reported_at INTEGER NOT NULL,
   PRIMARY KEY (machine, home)
 );
+
+-- The machine that first reported each session in its account readings. A session can be on several machines
+-- when session files are copied or synced between them; it counts on the machine where it was last active,
+-- and when those times agree, as for copied files, on the machine that reported it first, which is where it
+-- ran. Rows older than every tool's 30-day period are deleted.
+CREATE TABLE IF NOT EXISTS session_first_reports (
+  tool        TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  machine     TEXT NOT NULL,
+  reported_at INTEGER NOT NULL,
+  PRIMARY KEY (tool, session_id)
+);
+
+-- Open requests to sign a machine in (`sign-in-requests.ts`). The page that approves one is addressed by
+-- `request_id`; the daemon that opened it claims it with a secret stored here only as its SHA-256. A passkey
+-- sets `approved_at`; the claim then mints the machine's token and deletes the row, so each request yields
+-- one token. Expired rows are deleted when the next request is opened.
+CREATE TABLE IF NOT EXISTS sign_in_requests (
+  request_id  TEXT PRIMARY KEY,
+  claim_hash  TEXT NOT NULL UNIQUE,
+  machine     TEXT NOT NULL,
+  approved_at INTEGER,
+  expires_at  INTEGER NOT NULL
+);
+
+-- Each machine's skill refinement workflow as its daemon last reported it (`Refinement` in @jive-sh/skill-sync): running
+-- with what the dashboard's Skill refinement tab draws (its queue, runs, steps and limits, about 12 KB), or why it is
+-- not running. Kept so an offline machine's last report still shows; replaced on each report.
+CREATE TABLE IF NOT EXISTS machine_refinements (
+  machine     TEXT PRIMARY KEY,
+  refinement  TEXT NOT NULL,
+  reported_at INTEGER NOT NULL
+);

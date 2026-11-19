@@ -1,4 +1,7 @@
-import type { AccountIdentity, AccountKey, AccountLimits, AccountUsage, AccountView, LocalUse, MachineAccountReading, Money, UsageWindow } from "@jive-sh/skill-sync";
+import type {
+  AccountIdentity, AccountKey, AccountLimits, AccountUsage, AccountView, LocalUse, LocalUseTotal, MachineAccountReading, MachineAccountView, Money,
+  SessionUse, UsageWindow,
+} from "@jive-sh/skill-sync";
 
 /**
  * Checks the account usage a daemon sends before the hub keeps it.
@@ -11,6 +14,8 @@ import type { AccountIdentity, AccountKey, AccountLimits, AccountUsage, AccountV
 
 const MAX_ACCOUNTS = 32;
 const MAX_WINDOWS = 6;
+/** Claude Code keeps 30 days of sessions; the busiest account seen had a few hundred. */
+const MAX_SESSIONS = 5_000;
 
 export function accountsFrom(raw: unknown): AccountUsage[] {
   if (!Array.isArray(raw)) return [];
@@ -56,24 +61,33 @@ function limitsFrom(raw: unknown): AccountLimits | undefined {
   };
 }
 
-function localFrom(raw: unknown): LocalUse | undefined {
+/** Checked again when read back from the database, so rows a daemon before 0.7.0 sent, with counts instead of sessions, are dropped. */
+export function localFrom(raw: unknown): LocalUse | undefined {
   if (!isRecord(raw)) return undefined;
   const { state } = raw;
   if (state === "none") return { state };
   if (state === "unknown") return { state, reason: text(raw.reason, 200) };
-  if (state === "tokens") {
-    const { periodDays, count, sessions } = raw;
-    if (!isFinite(periodDays) || !isFinite(count) || !Number.isInteger(sessions)) return undefined;
-    return { state, periodDays, count, sessions: sessions as number };
-  }
+  const sessions = sessionsFrom(raw.sessions);
+  if (sessions === undefined || !isFinite(raw.periodDays)) return undefined;
+  const { periodDays } = raw;
+  if (state === "tokens") return { state, periodDays, sessions };
   if (state !== "spend") return undefined;
-  const { asOf, periodDays, sessions, partial, provider } = raw;
-  const spent = moneyFrom(raw.spent);
-  if (!isFinite(asOf) || !isFinite(periodDays) || !Number.isInteger(sessions) || typeof partial !== "boolean"
-    || (provider !== "bedrock" && provider !== null) || spent === undefined) {
+  const { currency, exponent, partial, provider } = raw;
+  if (typeof currency !== "string" || !Number.isInteger(exponent) || (exponent as number) < 0 || (exponent as number) > 6
+    || typeof partial !== "boolean" || (provider !== "bedrock" && provider !== null)) {
     return undefined;
   }
-  return { state, asOf, periodDays, spent, sessions: sessions as number, partial, provider };
+  return { state, periodDays, currency: currency.slice(0, 8), exponent: exponent as number, sessions, partial, provider };
+}
+
+function sessionsFrom(raw: unknown): SessionUse[] | undefined {
+  if (!Array.isArray(raw) || raw.length > MAX_SESSIONS) return undefined;
+  const sessions: SessionUse[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry) || typeof entry.id !== "string" || entry.id === "" || !isFinite(entry.amount) || !isFinite(entry.lastActiveAt)) return undefined;
+    sessions.push({ id: entry.id.slice(0, 100), amount: entry.amount, lastActiveAt: entry.lastActiveAt });
+  }
+  return sessions;
 }
 
 function windowFrom(raw: unknown): UsageWindow | undefined {
@@ -110,13 +124,17 @@ const text = (value: unknown, max: number): string => typeof value === "string" 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isFinite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 
+/** Which machine reported a session first, keyed by `sessionKey`: decides where a session found on two machines with the same last activity counts. */
+export type FirstReports = ReadonlyMap<string, string>;
+export const sessionKey = (input: { readonly tool: AccountUsage["tool"]; readonly id: string }): string => `${input.tool}:${input.id}`;
+
 /**
  * Every account across every machine, one entry each: an account its tool names is one entry however many
  * machines use it, keyed by its email (else the id its tool gives); one its tool cannot name is one entry
- * per folder per machine. Its limits are the freshest reading any machine sent, and its local use is each
- * machine's added up.
+ * per folder per machine. Its limits are the freshest reading any machine sent. Its local use counts each
+ * session once, on the machine it belongs to (`countSessionsOnce`), and adds the machines up.
  */
-export function groupAccounts(readings: ReadonlyArray<MachineAccountReading>): AccountView[] {
+export function groupAccounts(readings: ReadonlyArray<MachineAccountReading>, firstReports: FirstReports): AccountView[] {
   const groups = new Map<string, { key: AccountKey; readings: MachineAccountReading[] }>();
   for (const reading of readings) {
     const key = accountKey(reading);
@@ -126,15 +144,15 @@ export function groupAccounts(readings: ReadonlyArray<MachineAccountReading>): A
     groups.set(id, group);
   }
   return [...groups.values()].map(({ key, readings: group }): AccountView => {
-    const sorted = [...group].sort((a, b) => a.machine.localeCompare(b.machine));
+    const machines = countSessionsOnce(group, firstReports).sort((a, b) => a.machine.localeCompare(b.machine));
     const freshest = group.reduce(fresher);
     return {
       tool: freshest.usage.tool,
       key,
       identity: group.find((reading) => reading.usage.identity !== null)?.usage.identity ?? null,
       limits: freshest.usage.limits,
-      localTotal: addLocalUse(group.map((reading) => reading.usage.local)),
-      machines: sorted,
+      localTotal: addLocalUse(machines.map((machine) => machine.usage.local)),
+      machines,
     };
   }).sort((a, b) => a.tool.localeCompare(b.tool) || keyText(a.key).localeCompare(keyText(b.key)));
 }
@@ -157,8 +175,48 @@ function fresher(a: MachineAccountReading, b: MachineAccountReading): MachineAcc
   return b.reportedAt > a.reportedAt ? b : a;
 }
 
+/**
+ * Each machine's reading of one account, its local use reduced to the sessions that count on it. A session
+ * on several machines (session files copied or synced between them) counts once: on the machine where it
+ * was last active, and when they agree, as for copied files, on the machine that reported it first, which
+ * is where it ran. Its amount there covers the whole session, since each tool's figure for a session is
+ * cumulative.
+ */
+function countSessionsOnce(group: ReadonlyArray<MachineAccountReading>, firstReports: FirstReports): MachineAccountView[] {
+  const owners = new Map<string, { readonly machine: string; readonly lastActiveAt: number }>();
+  for (const { machine, usage } of group) {
+    if (usage.local.state !== "spend" && usage.local.state !== "tokens") continue;
+    for (const session of usage.local.sessions) {
+      const key = sessionKey({ tool: usage.tool, id: session.id });
+      const held = owners.get(key);
+      const wins = held === undefined || session.lastActiveAt > held.lastActiveAt
+        || (session.lastActiveAt === held.lastActiveAt && firstReports.get(key) === machine);
+      if (wins) owners.set(key, { machine, lastActiveAt: session.lastActiveAt });
+    }
+  }
+  return group.map(({ machine, reportedAt, usage }) => {
+    const { local } = usage;
+    if (local.state !== "spend" && local.state !== "tokens") return { machine, reportedAt, usage: { ...usage, local } };
+    const counted = local.sessions.filter((session) => owners.get(sessionKey({ tool: usage.tool, id: session.id }))?.machine === machine);
+    const amount = counted.reduce((sum, session) => sum + session.amount, 0);
+    const total: LocalUseTotal = local.state === "tokens"
+      ? { state: "tokens", periodDays: local.periodDays, count: amount, sessions: counted.length }
+      : counted.length === 0 ? { state: "none" }
+      : {
+        state: "spend",
+        asOf: Math.max(...counted.map((session) => session.lastActiveAt)),
+        periodDays: local.periodDays,
+        spent: { amountMinor: amount, currency: local.currency, exponent: local.exponent },
+        sessions: counted.length,
+        partial: local.partial,
+        provider: local.provider,
+      };
+    return { machine, reportedAt, usage: { ...usage, local: total } };
+  });
+}
+
 /** Machines' local use added up. One that could not be read makes the total a lower bound. */
-export function addLocalUse(uses: ReadonlyArray<LocalUse>): LocalUse {
+export function addLocalUse(uses: ReadonlyArray<LocalUseTotal>): LocalUseTotal {
   const read = uses.filter((use) => use.state === "spend" || use.state === "tokens");
   const unreadable = uses.find((use) => use.state === "unknown");
   if (read.length === 0) return unreadable ?? { state: "none" };
